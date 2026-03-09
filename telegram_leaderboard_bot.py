@@ -289,6 +289,23 @@ async def exportweek(msg: Message):
 
 @router.message()
 async def track_comments(msg: Message):
+    @router.message()
+async def track_comments(msg: Message):
+
+    # DEBUG
+    if msg.text == "/debugcomment":
+        await msg.answer(
+            f"chat_id={msg.chat.id}\n"
+            f"user_id={msg.from_user.id if msg.from_user else 'none'}\n"
+            f"text={msg.text}\n"
+            f"message_thread_id={msg.message_thread_id}\n"
+            f"reply_to_message_id={msg.reply_to_message.message_id if msg.reply_to_message else 'none'}\n"
+            f"discussion_env={DISCUSSION_CHAT_ID}"
+        )
+        return
+
+    if msg.chat.id != DISCUSSION_CHAT_ID:
+        return
 
     if msg.chat.id != DISCUSSION_CHAT_ID:
         return
