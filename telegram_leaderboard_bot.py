@@ -15,6 +15,7 @@ from aiogram.types import FSInputFile, Message, MessageReactionUpdated
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DISCUSSION_CHAT_ID = int(os.getenv("DISCUSSION_CHAT_ID") or "0")
+COMMUNITY_CHAT_ID = int(os.getenv("COMMUNITY_CHAT_ID") or "0")
 TIMEZONE = os.getenv("TIMEZONE") or "Europe/Istanbul"
 
 ADMIN_USER_IDS = {
@@ -25,9 +26,12 @@ ADMIN_USER_IDS = {
 
 DB_PATH = "leaderboard.db"
 
+DISCUSSION_COMMENT_POINTS = 3
+COMMUNITY_MESSAGE_POINTS = 1
 REACTION_POINTS = 1
-COMMENT_POINTS = 3
-MAX_COMMENTS_PER_THREAD = 3
+
+MAX_DISCUSSION_COMMENTS_PER_THREAD = 3
+COMMUNITY_MESSAGE_COOLDOWN_SECONDS = 30
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
@@ -44,6 +48,10 @@ dp.include_router(router)
 
 def now() -> datetime:
     return datetime.now(ZoneInfo(TIMEZONE))
+
+
+def now_iso() -> str:
+    return now().isoformat()
 
 
 def week_key() -> str:
@@ -78,25 +86,39 @@ CREATE TABLE IF NOT EXISTS scores (
     PRIMARY KEY (week, user_id)
 );
 
-CREATE TABLE IF NOT EXISTS reactions (
-    week TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
-    chat_id INTEGER NOT NULL,
-    message_id INTEGER NOT NULL,
-    PRIMARY KEY (week, user_id, chat_id, message_id)
-);
-
-CREATE TABLE IF NOT EXISTS comments (
+CREATE TABLE IF NOT EXISTS discussion_comments (
     week TEXT NOT NULL,
     user_id INTEGER NOT NULL,
     chat_id INTEGER NOT NULL,
     thread TEXT NOT NULL,
     message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
     PRIMARY KEY (week, message_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_comments_lookup
-ON comments (week, user_id, chat_id, thread);
+CREATE INDEX IF NOT EXISTS idx_discussion_lookup
+ON discussion_comments (week, user_id, chat_id, thread);
+
+CREATE TABLE IF NOT EXISTS community_messages (
+    week TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (week, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_message_lookup
+ON community_messages (week, user_id, chat_id, created_at);
+
+CREATE TABLE IF NOT EXISTS reactions (
+    week TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (week, user_id, chat_id, message_id)
+);
 """
 
 
@@ -123,52 +145,28 @@ async def add_or_update_score(
 
     if row:
         await db.execute(
-            "UPDATE scores SET points = points + ?, username = ?, full_name = ? WHERE week=? AND user_id=?",
+            """
+            UPDATE scores
+            SET points = points + ?, username = ?, full_name = ?
+            WHERE week=? AND user_id=?
+            """,
             (points_to_add, username, full_name, w, user_id)
         )
     else:
         await db.execute(
-            "INSERT INTO scores (week, user_id, username, full_name, points) VALUES (?, ?, ?, ?, ?)",
+            """
+            INSERT INTO scores (week, user_id, username, full_name, points)
+            VALUES (?, ?, ?, ?, ?)
+            """,
             (w, user_id, username, full_name, points_to_add)
         )
 
 
-async def handle_reaction(
-    user_id: int,
-    username: str | None,
-    full_name: str | None,
-    chat_id: int,
-    message_id: int,
-) -> bool:
-    w = week_key()
+# =========================================================
+# POINT LOGIC
+# =========================================================
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM reactions WHERE week=? AND user_id=? AND chat_id=? AND message_id=?",
-            (w, user_id, chat_id, message_id)
-        )
-
-        if await cur.fetchone():
-            return False
-
-        await db.execute(
-            "INSERT INTO reactions (week, user_id, chat_id, message_id) VALUES (?, ?, ?, ?)",
-            (w, user_id, chat_id, message_id)
-        )
-
-        await add_or_update_score(
-            db=db,
-            user_id=user_id,
-            username=username,
-            full_name=full_name,
-            points_to_add=REACTION_POINTS
-        )
-
-        await db.commit()
-        return True
-
-
-async def handle_comment(
+async def handle_discussion_comment(
     user_id: int,
     username: str | None,
     full_name: str | None,
@@ -180,18 +178,26 @@ async def handle_comment(
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT COUNT(*) FROM comments WHERE week=? AND user_id=? AND chat_id=? AND thread=?",
+            """
+            SELECT COUNT(*)
+            FROM discussion_comments
+            WHERE week=? AND user_id=? AND chat_id=? AND thread=?
+            """,
             (w, user_id, chat_id, thread)
         )
         row = await cur.fetchone()
         count = row[0] if row else 0
 
-        if count >= MAX_COMMENTS_PER_THREAD:
+        if count >= MAX_DISCUSSION_COMMENTS_PER_THREAD:
             return False
 
         await db.execute(
-            "INSERT OR IGNORE INTO comments (week, user_id, chat_id, thread, message_id) VALUES (?, ?, ?, ?, ?)",
-            (w, user_id, chat_id, thread, message_id)
+            """
+            INSERT OR IGNORE INTO discussion_comments
+            (week, user_id, chat_id, thread, message_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (w, user_id, chat_id, thread, message_id, now_iso())
         )
 
         cur = await db.execute("SELECT changes()")
@@ -206,12 +212,115 @@ async def handle_comment(
             user_id=user_id,
             username=username,
             full_name=full_name,
-            points_to_add=COMMENT_POINTS
+            points_to_add=DISCUSSION_COMMENT_POINTS
         )
 
         await db.commit()
         return True
 
+
+async def handle_community_message(
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    w = week_key()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT created_at
+            FROM community_messages
+            WHERE week=? AND user_id=? AND chat_id=?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (w, user_id, chat_id)
+        )
+        row = await cur.fetchone()
+
+        if row:
+            last_created_at = datetime.fromisoformat(row[0])
+            diff = (now() - last_created_at).total_seconds()
+            if diff < COMMUNITY_MESSAGE_COOLDOWN_SECONDS:
+                return False
+
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO community_messages
+            (week, user_id, chat_id, message_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (w, user_id, chat_id, message_id, now_iso())
+        )
+
+        cur = await db.execute("SELECT changes()")
+        changed = await cur.fetchone()
+        inserted = (changed[0] if changed else 0) > 0
+
+        if not inserted:
+            return False
+
+        await add_or_update_score(
+            db=db,
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            points_to_add=COMMUNITY_MESSAGE_POINTS
+        )
+
+        await db.commit()
+        return True
+
+
+async def handle_reaction(
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    w = week_key()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT 1
+            FROM reactions
+            WHERE week=? AND user_id=? AND chat_id=? AND message_id=?
+            """,
+            (w, user_id, chat_id, message_id)
+        )
+
+        if await cur.fetchone():
+            return False
+
+        await db.execute(
+            """
+            INSERT INTO reactions
+            (week, user_id, chat_id, message_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (w, user_id, chat_id, message_id, now_iso())
+        )
+
+        await add_or_update_score(
+            db=db,
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            points_to_add=REACTION_POINTS
+        )
+
+        await db.commit()
+        return True
+
+
+# =========================================================
+# QUERIES
+# =========================================================
 
 async def get_leaderboard(limit: int = 10):
     w = week_key()
@@ -250,8 +359,9 @@ async def reset_current_week() -> None:
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM scores WHERE week=?", (w,))
+        await db.execute("DELETE FROM discussion_comments WHERE week=?", (w,))
+        await db.execute("DELETE FROM community_messages WHERE week=?", (w,))
         await db.execute("DELETE FROM reactions WHERE week=?", (w,))
-        await db.execute("DELETE FROM comments WHERE week=?", (w,))
         await db.commit()
 
 
@@ -366,11 +476,11 @@ async def exportweek(msg: Message):
 
 
 # =========================================================
-# COMMENT TRACKING
+# MESSAGE TRACKING
 # =========================================================
 
 @router.message()
-async def track_comments(msg: Message):
+async def track_messages(msg: Message):
     if not msg.from_user:
         return
 
@@ -380,27 +490,38 @@ async def track_comments(msg: Message):
     if is_admin_user(msg.from_user.id):
         return
 
-    if DISCUSSION_CHAT_ID and msg.chat.id != DISCUSSION_CHAT_ID:
-        return
-
     if msg.text and msg.text.startswith("/"):
         return
 
-    if msg.message_thread_id:
-        thread = str(msg.message_thread_id)
-    elif msg.reply_to_message:
-        thread = str(msg.reply_to_message.message_id)
-    else:
+    # 1) Discussion group / post comments
+    if DISCUSSION_CHAT_ID and msg.chat.id == DISCUSSION_CHAT_ID:
+        if msg.message_thread_id:
+            thread = str(msg.message_thread_id)
+        elif msg.reply_to_message:
+            thread = str(msg.reply_to_message.message_id)
+        else:
+            return
+
+        await handle_discussion_comment(
+            user_id=msg.from_user.id,
+            username=msg.from_user.username,
+            full_name=msg.from_user.full_name,
+            chat_id=msg.chat.id,
+            thread=thread,
+            message_id=msg.message_id
+        )
         return
 
-    await handle_comment(
-        user_id=msg.from_user.id,
-        username=msg.from_user.username,
-        full_name=msg.from_user.full_name,
-        chat_id=msg.chat.id,
-        thread=thread,
-        message_id=msg.message_id
-    )
+    # 2) Community chat normal messages
+    if COMMUNITY_CHAT_ID and msg.chat.id == COMMUNITY_CHAT_ID:
+        await handle_community_message(
+            user_id=msg.from_user.id,
+            username=msg.from_user.username,
+            full_name=msg.from_user.full_name,
+            chat_id=msg.chat.id,
+            message_id=msg.message_id
+        )
+        return
 
 
 # =========================================================
@@ -421,6 +542,10 @@ async def track_reaction(event: MessageReactionUpdated):
         return
 
     if not event.new_reaction:
+        return
+
+    # Reaction puanını sadece community chat için yaz
+    if COMMUNITY_CHAT_ID and event.chat.id != COMMUNITY_CHAT_ID:
         return
 
     await handle_reaction(
