@@ -124,7 +124,23 @@ async def handle_reaction(user_id, username, full_name, chat_id, message_id):
             (w, user_id, chat_id, message_id)
         )
 
-        await add_points(user_id, username, full_name, REACTION_POINTS)
+        cur = await db.execute(
+            "SELECT points FROM scores WHERE week=? AND user_id=?",
+            (w, user_id)
+        )
+
+        row = await cur.fetchone()
+
+        if row:
+            await db.execute(
+                "UPDATE scores SET points = points + ? WHERE week=? AND user_id=?",
+                (REACTION_POINTS, w, user_id)
+            )
+        else:
+            await db.execute(
+                "INSERT INTO scores VALUES (?,?,?,?,?)",
+                (w, user_id, username, full_name, REACTION_POINTS)
+            )
 
         await db.commit()
 
@@ -150,7 +166,23 @@ async def handle_comment(user_id, username, full_name, chat_id, thread, message_
             (w, user_id, chat_id, thread, message_id)
         )
 
-        await add_points(user_id, username, full_name, COMMENT_POINTS)
+        cur = await db.execute(
+            "SELECT points FROM scores WHERE week=? AND user_id=?",
+            (w, user_id)
+        )
+
+        row = await cur.fetchone()
+
+        if row:
+            await db.execute(
+                "UPDATE scores SET points = points + ? WHERE week=? AND user_id=?",
+                (COMMENT_POINTS, w, user_id)
+            )
+        else:
+            await db.execute(
+                "INSERT INTO scores VALUES (?,?,?,?,?)",
+                (w, user_id, username, full_name, COMMENT_POINTS)
+            )
 
         await db.commit()
 
