@@ -184,7 +184,9 @@ async def get_user_stats(user_id):
 
         return await cur.fetchone()
 
-
+@router.message(Command("chatid"))
+async def chat_id_cmd(msg: Message):
+    await msg.answer(f"Chat ID: {msg.chat.id}")
 @router.message(Command("leaderboard"))
 async def leaderboard(msg: Message):
 
