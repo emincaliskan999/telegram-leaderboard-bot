@@ -10,7 +10,7 @@ from aiogram.types import Message, MessageReactionUpdated, FSInputFile
 from aiogram.filters import Command
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DISCUSSION_CHAT_ID = int(os.getenv("DISCUSSION_CHAT_ID", "0"))
+DISCUSSION_CHAT_ID = int(os.getenv("DISCUSSION_CHAT_ID") or "0")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Istanbul")
 
 ADMIN_USER_IDS = {
